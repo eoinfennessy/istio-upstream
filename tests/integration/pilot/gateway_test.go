@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"istio.io/istio/pilot/pkg/model/kstatus"
@@ -43,21 +44,67 @@ import (
 	ingressutil "istio.io/istio/tests/integration/security/sds_ingress/util"
 )
 
+const customGatewayClassAndControllerPatch = `[
+	{
+		"op": "add",
+		"path": "/spec/template/spec/containers/0/env/-",
+		"value": {
+			"name": "PILOT_GATEWAY_API_DEFAULT_GATEWAYCLASS",
+			"value": "openshift-default"
+		}
+	},
+	{
+		"op": "add",
+		"path": "/spec/template/spec/containers/0/env/-",
+		"value": {
+			"name": "PILOT_GATEWAY_API_CONTROLLER_NAME",
+			"value": "openshift.io/gateway-controller"
+		}
+	}
+]`
+
 func TestGateway(t *testing.T) {
 	framework.
 		NewTest(t).
 		Run(func(t framework.TestContext) {
 			crd.DeployGatewayAPIOrSkip(t)
+			t.NewSubTest("unmanaged").Run(func(t framework.TestContext) {
+				UnmanagedGatewayTest(t, "istio")
+			})
+			t.NewSubTest("managed").Run(func(t framework.TestContext) {
+				ManagedGatewayTest(t, "istio")
+			})
+			t.NewSubTest("managed-owner").Run(func(t framework.TestContext) {
+				ManagedOwnerGatewayTest(t, "istio")
+			})
+			t.NewSubTest("status").Run(func(t framework.TestContext) {
+				StatusGatewayTest(t, "istio")
+			})
+			t.NewSubTest("managed-short-name").Run(func(t framework.TestContext) {
+				ManagedGatewayShortNameTest(t, "istio")
+			})
 
-			t.NewSubTest("unmanaged").Run(UnmanagedGatewayTest)
-			t.NewSubTest("managed").Run(ManagedGatewayTest)
-			t.NewSubTest("managed-owner").Run(ManagedOwnerGatewayTest)
-			t.NewSubTest("status").Run(StatusGatewayTest)
-			t.NewSubTest("managed-short-name").Run(ManagedGatewayShortNameTest)
+			patchIstiodAndWait(t, customGatewayClassAndControllerPatch)
+
+			t.NewSubTest("unmanaged-custom-names").Run(func(t framework.TestContext) {
+				UnmanagedGatewayTest(t, "openshift-default")
+			})
+			t.NewSubTest("managed-custom-names").Run(func(t framework.TestContext) {
+				ManagedGatewayTest(t, "openshift-default")
+			})
+			t.NewSubTest("managed-owner-custom-names").Run(func(t framework.TestContext) {
+				ManagedOwnerGatewayTest(t, "openshift-default")
+			})
+			t.NewSubTest("status-custom-names").Run(func(t framework.TestContext) {
+				StatusGatewayTest(t, "openshift-default")
+			})
+			t.NewSubTest("managed-short-name-custom-names").Run(func(t framework.TestContext) {
+				ManagedGatewayShortNameTest(t, "openshift-default")
+			})
 		})
 }
 
-func ManagedOwnerGatewayTest(t framework.TestContext) {
+func ManagedOwnerGatewayTest(t framework.TestContext, gatewayClassName string) {
 	image := fmt.Sprintf("%s/app:%s", t.Settings().Image.Hub, t.Settings().Image.Tag)
 	t.ConfigIstio().YAML(apps.Namespace.Name(), fmt.Sprintf(`
 apiVersion: v1
@@ -97,19 +144,19 @@ spec:
 		t.Fatal(err)
 	}
 
-	t.ConfigIstio().YAML(apps.Namespace.Name(), `
+	t.ConfigIstio().YAML(apps.Namespace.Name(), fmt.Sprintf(`
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
   name: managed-owner
 spec:
-  gatewayClassName: istio
+  gatewayClassName: %s
   listeners:
   - name: default
     hostname: "*.example.com"
     port: 80
     protocol: HTTP
-`).ApplyOrFail(t)
+`, gatewayClassName)).ApplyOrFail(t)
 
 	// Make sure Gateway becomes programmed..
 	client := t.Clusters().Kube().Default().GatewayAPI().GatewayV1beta1().Gateways(apps.Namespace.Name())
@@ -143,13 +190,14 @@ spec:
 	assert.Equal(t, svc.Spec.Type, corev1.ServiceTypeClusterIP)
 }
 
-func ManagedGatewayTest(t framework.TestContext) {
-	t.ConfigIstio().YAML(apps.Namespace.Name(), `apiVersion: gateway.networking.k8s.io/v1beta1
+func ManagedGatewayTest(t framework.TestContext, gatewayClassName string) {
+	t.ConfigIstio().YAML(apps.Namespace.Name(), fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
   name: gateway
 spec:
-  gatewayClassName: istio
+  gatewayClassName: %s
   listeners:
   - name: default
     hostname: "*.example.com"
@@ -181,7 +229,8 @@ spec:
   - backendRefs:
     - name: d
       port: 80
-`).ApplyOrFail(t)
+`, gatewayClassName)).ApplyOrFail(t)
+
 	testCases := []struct {
 		check echo.Checker
 		from  echo.Instances
@@ -246,20 +295,21 @@ spec:
 				HTTP: echo.HTTP{
 					Headers: headers.New().WithHost(tc.host).Build(),
 				},
-				Address: fmt.Sprintf("gateway-istio.%s.svc.cluster.local", apps.Namespace.Name()),
+				Address: fmt.Sprintf("gateway-%s.%s.svc.cluster.local", gatewayClassName, apps.Namespace.Name()),
 				Check:   tc.check,
 			})
 		})
 	}
 }
 
-func ManagedGatewayShortNameTest(t framework.TestContext) {
-	t.ConfigIstio().YAML(apps.Namespace.Name(), `apiVersion: gateway.networking.k8s.io/v1beta1
+func ManagedGatewayShortNameTest(t framework.TestContext, gatewayClassName string) {
+	t.ConfigIstio().YAML(apps.Namespace.Name(), fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
 metadata:
   name: gateway
 spec:
-  gatewayClassName: istio
+  gatewayClassName: %s
   listeners:
   - name: default
     hostname: "bar"
@@ -277,14 +327,14 @@ spec:
   - backendRefs:
     - name: b
       port: 80
-`).ApplyOrFail(t)
+`, gatewayClassName)).ApplyOrFail(t)
 	apps.B[0].CallOrFail(t, echo.CallOptions{
 		Port:   echo.Port{ServicePort: 80},
 		Scheme: scheme.HTTP,
 		HTTP: echo.HTTP{
 			Headers: headers.New().WithHost("bar").Build(),
 		},
-		Address: fmt.Sprintf("gateway-istio.%s.svc.cluster.local", apps.Namespace.Name()),
+		Address: fmt.Sprintf("gateway-%s.%s.svc.cluster.local", gatewayClassName, apps.Namespace.Name()),
 		Check:   check.OK(),
 		Retry: echo.Retry{
 			Options: []retry.Option{retry.Timeout(time.Minute)},
@@ -296,7 +346,7 @@ spec:
 		HTTP: echo.HTTP{
 			Headers: headers.New().WithHost("bar.example.com").Build(),
 		},
-		Address: fmt.Sprintf("gateway-istio.%s.svc.cluster.local", apps.Namespace.Name()),
+		Address: fmt.Sprintf("gateway-%s.%s.svc.cluster.local", gatewayClassName, apps.Namespace.Name()),
 		Check:   check.NotOK(),
 		Retry: echo.Retry{
 			Options: []retry.Option{retry.Timeout(time.Minute)},
@@ -304,7 +354,7 @@ spec:
 	})
 }
 
-func UnmanagedGatewayTest(t framework.TestContext) {
+func UnmanagedGatewayTest(t framework.TestContext, gatewayClassName string) {
 	ingressutil.CreateIngressKubeSecret(t, "test-gateway-cert-same", ingressutil.TLS, ingressutil.IngressCredentialA,
 		false, t.Clusters().Configs()...)
 	ingressutil.CreateIngressKubeSecretInNamespace(t, "test-gateway-cert-cross", ingressutil.TLS, ingressutil.IngressCredentialB,
@@ -556,7 +606,7 @@ spec:
 			})
 			t.NewSubTest("status").Run(func(t framework.TestContext) {
 				retry.UntilSuccessOrFail(t, func() error {
-					gwc, err := t.Clusters().Kube().Default().GatewayAPI().GatewayV1beta1().GatewayClasses().Get(context.Background(), "istio", metav1.GetOptions{})
+					gwc, err := t.Clusters().Kube().Default().GatewayAPI().GatewayV1beta1().GatewayClasses().Get(context.Background(), gatewayClassName, metav1.GetOptions{})
 					if err != nil {
 						return err
 					}
@@ -596,13 +646,13 @@ spec:
 	}
 }
 
-func StatusGatewayTest(t framework.TestContext) {
+func StatusGatewayTest(t framework.TestContext, gatewayClassName string) {
 	client := t.Clusters().Kube().Default().GatewayAPI().GatewayV1beta1().GatewayClasses()
 
 	check := func() error {
-		gwc, _ := client.Get(context.Background(), "istio", metav1.GetOptions{})
+		gwc, _ := client.Get(context.Background(), gatewayClassName, metav1.GetOptions{})
 		if gwc == nil {
-			return fmt.Errorf("failed to find GatewayClass istio")
+			return fmt.Errorf("failed to find GatewayClass %s", gatewayClassName)
 		}
 		cond := kstatus.GetCondition(gwc.Status.Conditions, string(k8sv1.GatewayClassConditionStatusAccepted))
 		if cond.Status != metav1.ConditionTrue {
@@ -616,7 +666,7 @@ func StatusGatewayTest(t framework.TestContext) {
 	retry.UntilSuccessOrFail(t, check)
 
 	// Wipe out the status
-	gwc, _ := client.Get(context.Background(), "istio", metav1.GetOptions{})
+	gwc, _ := client.Get(context.Background(), gatewayClassName, metav1.GetOptions{})
 	gwc.Status.Conditions = nil
 	client.Update(context.Background(), gwc, metav1.UpdateOptions{})
 	// It should be added back
@@ -686,4 +736,31 @@ func TestGatewayMetricsEndpoints(t *testing.T) {
 				})
 			}
 		})
+}
+
+func patchIstiodAndWait(t framework.TestContext, patch string) {
+	if err := retry.UntilSuccess(func() error {
+		_, err := t.Clusters().Kube().Default().Kube().AppsV1().Deployments(istio.DefaultSystemNamespace).
+			Patch(t.Context(), "istiod", types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
+		return err
+	}, retry.Timeout(30*time.Second), retry.Delay(time.Second)); err != nil {
+		t.Fatalf("failed to patch istiod: %v", err)
+	}
+
+	if err := retry.UntilSuccess(func() error {
+		istiod, err := t.Clusters().Kube().Default().Kube().AppsV1().Deployments(istio.DefaultSystemNamespace).
+			Get(t.Context(), "istiod", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get istiod deployment: %v", err)
+		}
+		if istiod.Generation != istiod.Status.ObservedGeneration {
+			return fmt.Errorf("istiod deployment is not ready - generation %d does not match observed generation %d", istiod.Generation, istiod.Status.ObservedGeneration)
+		}
+		if istiod.Status.ReadyReplicas != istiod.Status.Replicas {
+			return fmt.Errorf("istiod deployment is not ready - %d of %d pods are ready", istiod.Status.ReadyReplicas, istiod.Status.Replicas)
+		}
+		return nil
+	}, retry.Timeout(30*time.Second), retry.Delay(time.Second)); err != nil {
+		t.Fatalf("istiod failed to become ready: %v", err)
+	}
 }
